@@ -1,0 +1,281 @@
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { toast } from 'sonner';
+import { StepGrid } from '@/components/StepGrid';
+import { TransportControls } from '@/components/TransportControls';
+import { SavedBeats } from '@/components/SavedBeats';
+import { DEFAULT_TRACKS, STEP_COUNT, playSound, saveBeat, getSavedBeats, Beat, Track } from '@/lib/audioEngine';
+import { Disc3, Sparkles } from 'lucide-react';
+
+function deepCloneTracks(tracks: Track[]): Track[] {
+  return tracks.map(t => ({ ...t, steps: [...t.steps] }));
+}
+
+// Pad or trim preset patterns to match STEP_COUNT (32 steps — repeat the 16-step pattern)
+function expandPattern(p: boolean[]): boolean[] {
+  const out = Array(STEP_COUNT).fill(false);
+  for (let i = 0; i < STEP_COUNT; i++) out[i] = p[i % p.length];
+  return out;
+}
+
+const PRESET_PATTERNS: Record<string, boolean[][]> = {
+  'Hip Hop': [
+    expandPattern([true,false,false,false,false,false,false,false,true,false,true,false,false,false,false,false]),
+    expandPattern([false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false]),
+    expandPattern([true,false,true,false,true,false,true,false,true,false,true,false,true,false,true,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,true]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false]),
+  ],
+  'Trap': [
+    expandPattern([true,false,false,false,false,false,true,false,false,false,false,false,true,false,false,false]),
+    expandPattern([false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,true]),
+    expandPattern([true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true]),
+    expandPattern([false,false,false,true,false,false,false,false,false,false,false,true,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([true,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,true,false,false,false,false,false,false,false,true]),
+  ],
+  'House': [
+    expandPattern([true,false,false,false,true,false,false,false,true,false,false,false,true,false,false,false]),
+    expandPattern([false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false]),
+    expandPattern([false,false,true,false,false,false,true,false,false,false,true,false,false,false,true,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,true,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([true,false,false,false,false,false,false,false,true,false,false,false,false,false,false,false]),
+  ],
+  'Lo-Fi': [
+    expandPattern([true,false,false,false,false,false,false,true,false,false,true,false,false,false,false,false]),
+    expandPattern([false,false,false,false,true,false,false,false,false,false,false,false,true,false,false,false]),
+    expandPattern([true,false,false,true,false,false,true,false,true,false,false,true,false,false,true,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,true,false,false,false,false]),
+    expandPattern([false,false,true,false,false,false,false,false,false,false,true,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false]),
+    expandPattern([false,false,false,false,false,false,false,false,false,false,false,false,false,true,false,false]),
+  ],
+};
+
+export default function Index() {
+  const [tracks, setTracks] = useState<Track[]>(deepCloneTracks(DEFAULT_TRACKS));
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentStep, setCurrentStep] = useState(-1);
+  const [bpm, setBpm] = useState(120);
+  const [beatName, setBeatName] = useState('Untitled Beat');
+  const [savedBeats, setSavedBeats] = useState<Beat[]>(getSavedBeats());
+  const intervalRef = useRef<number | null>(null);
+
+  const stopPlayback = useCallback(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    intervalRef.current = null;
+    setIsPlaying(false);
+    setCurrentStep(-1);
+  }, []);
+
+  const startPlayback = useCallback(() => {
+    stopPlayback();
+    setIsPlaying(true);
+    let step = 0;
+    const interval = (60 / bpm / 4) * 1000;
+    const tick = () => {
+      setCurrentStep(step);
+      setTracks(prev => {
+        prev.forEach(track => {
+          if (!track.muted && track.steps[step]) {
+            playSound(track.name, track.volume);
+          }
+        });
+        return prev;
+      });
+      step = (step + 1) % STEP_COUNT;
+    };
+    tick();
+    intervalRef.current = window.setInterval(tick, interval);
+  }, [bpm, stopPlayback]);
+
+  useEffect(() => () => { if (intervalRef.current) clearInterval(intervalRef.current); }, []);
+
+  const toggleStep = (trackIdx: number, stepIdx: number) => {
+    setTracks(prev => {
+      const next = deepCloneTracks(prev);
+      next[trackIdx].steps[stepIdx] = !next[trackIdx].steps[stepIdx];
+      return next;
+    });
+  };
+
+  const toggleMute = (trackIdx: number) => {
+    setTracks(prev => {
+      const next = deepCloneTracks(prev);
+      next[trackIdx].muted = !next[trackIdx].muted;
+      return next;
+    });
+  };
+
+  const changeVolume = (trackIdx: number, volume: number) => {
+    setTracks(prev => {
+      const next = deepCloneTracks(prev);
+      next[trackIdx].volume = volume;
+      return next;
+    });
+  };
+
+  const handleSave = () => {
+    const beat: Beat = {
+      id: crypto.randomUUID(),
+      name: beatName || 'Untitled Beat',
+      bpm,
+      tracks: deepCloneTracks(tracks),
+      createdAt: Date.now(),
+    };
+    saveBeat(beat);
+    setSavedBeats(getSavedBeats());
+    toast.success('Beat saved!');
+  };
+
+  const handleLoad = (beat: Beat) => {
+    stopPlayback();
+    // Ensure loaded beats have correct step count
+    const loadedTracks = beat.tracks.map(t => ({
+      ...t,
+      steps: t.steps.length >= STEP_COUNT
+        ? t.steps.slice(0, STEP_COUNT)
+        : [...t.steps, ...Array(STEP_COUNT - t.steps.length).fill(false)],
+    }));
+    setTracks(deepCloneTracks(loadedTracks));
+    setBpm(beat.bpm);
+    setBeatName(beat.name);
+    toast.info(`Loaded "${beat.name}"`);
+  };
+
+  const handleNewBeat = () => {
+    stopPlayback();
+    setTracks(deepCloneTracks(DEFAULT_TRACKS));
+    setBeatName('Untitled Beat');
+    setBpm(120);
+    toast.success('New beat created');
+  };
+
+  const loadPreset = (name: string) => {
+    stopPlayback();
+    const pattern = PRESET_PATTERNS[name];
+    setTracks(prev => {
+      const next = deepCloneTracks(prev);
+      pattern.forEach((steps, i) => {
+        if (next[i]) next[i].steps = [...steps];
+      });
+      return next;
+    });
+    setBeatName(name);
+    toast.info(`Loaded "${name}" preset`);
+  };
+
+  const activeStepCount = tracks.reduce((n, t) => n + t.steps.filter(Boolean).length, 0);
+  const barDuration = (60 / bpm * 4 * 2).toFixed(1); // 32 steps = 2 bars
+
+  return (
+    <div className="min-h-screen flex flex-col lg:flex-row">
+      {/* Sidebar */}
+      <aside className="w-full lg:w-64 bg-surface-sunken border-b lg:border-b-0 lg:border-r border-border flex flex-col shrink-0">
+        <div className="p-4 flex items-center gap-3 border-b border-border">
+          <div className="w-9 h-9 bg-primary rounded-lg flex items-center justify-center shadow-lg shadow-primary/30">
+            <Disc3 className="w-5 h-5 text-primary-foreground" />
+          </div>
+          <div>
+            <h1 className="text-base font-extrabold tracking-tight text-foreground">BeatForge</h1>
+            <p className="text-[9px] text-muted-foreground uppercase tracking-[0.2em] font-bold">Studio Pro</p>
+          </div>
+        </div>
+
+        {/* Presets */}
+        <div className="p-3 border-b border-border">
+          <h3 className="text-[10px] text-muted-foreground uppercase tracking-[0.15em] font-bold mb-2.5 flex items-center gap-1.5">
+            <Sparkles className="w-3 h-3 text-primary" /> AI Presets
+          </h3>
+          <div className="grid grid-cols-2 gap-1.5">
+            {Object.keys(PRESET_PATTERNS).map(name => (
+              <button
+                key={name}
+                onClick={() => loadPreset(name)}
+                className="px-2.5 py-1.5 text-[11px] font-bold rounded-md bg-secondary hover:bg-primary/20 hover:text-primary transition-all text-left"
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Saved Beats */}
+        <div className="flex-1 overflow-y-auto scrollbar-thin">
+          <h3 className="text-[10px] text-muted-foreground uppercase tracking-[0.15em] font-bold px-3 pt-3 pb-1.5">
+            Your Library
+          </h3>
+          <SavedBeats beats={savedBeats} onLoad={handleLoad} onRefresh={() => setSavedBeats(getSavedBeats())} />
+        </div>
+
+        {/* Stats footer */}
+        <div className="p-3 border-t border-border">
+          <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+            <span>{savedBeats.length} beats saved</span>
+            <span>v2.0</span>
+          </div>
+        </div>
+      </aside>
+
+      {/* Main content */}
+      <main className="flex-1 flex flex-col overflow-hidden">
+        {/* Transport */}
+        <div className="p-3 lg:p-4">
+          <TransportControls
+            isPlaying={isPlaying}
+            bpm={bpm}
+            beatName={beatName}
+            onPlay={startPlayback}
+            onStop={stopPlayback}
+            onReset={() => { stopPlayback(); setCurrentStep(-1); }}
+            onBpmChange={setBpm}
+            onBeatNameChange={setBeatName}
+            onSave={handleSave}
+            onNewBeat={handleNewBeat}
+          />
+        </div>
+
+        {/* Step Grid */}
+        <div className="flex-1 overflow-auto p-3 lg:p-4 pt-0 lg:pt-0">
+          <div className="bg-card rounded-xl border border-border p-3 min-w-fit">
+            <StepGrid
+              tracks={tracks}
+              currentStep={currentStep}
+              isPlaying={isPlaying}
+              onToggleStep={toggleStep}
+              onToggleMute={toggleMute}
+              onVolumeChange={changeVolume}
+            />
+          </div>
+        </div>
+
+        {/* Footer */}
+        <footer className="px-4 py-2.5 border-t border-border bg-surface-sunken">
+          <div className="flex items-center justify-between">
+            <p className="text-[10px] text-muted-foreground font-medium">
+              <span className="text-primary font-bold">{activeStepCount}</span> steps active
+              &nbsp;·&nbsp; <span className="text-foreground font-bold">{bpm}</span> BPM
+              &nbsp;·&nbsp; {barDuration}s / 2 bars
+              &nbsp;·&nbsp; {STEP_COUNT} steps
+            </p>
+            <p className="text-[10px] text-muted-foreground font-medium">
+              BeatForge Pro
+            </p>
+          </div>
+        </footer>
+      </main>
+    </div>
+  );
+} 
